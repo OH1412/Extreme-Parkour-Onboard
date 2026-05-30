@@ -44,6 +44,88 @@ This script fuses the depth image and proprioception data. Now the robot is in t
 
 ## Notes and Tips
 
+#### Heightmap Student Deployment (No Depth Camera)
+If your student model is distilled from **heightmap points** (e.g. LiDAR elevation samples) and does not rely on depth camera encoder, use:
+```bash
+python3 run_extreme_parkour_heightmap.py \
+	--logdir traced \
+	--heightmap_model your_heightmap_jit.pt \
+	--heightmap_topic /heightmap_points \
+	--n_points 132 \
+	--mode parkour --nodryrun
+```
+
+The topic `--heightmap_topic` should publish `std_msgs/Float32MultiArray` with exactly `n_points` values per message.
+This script keeps the same joystick state machine as depth deployment:
+- `R1`: stand up
+- `R2`: lie down
+- `L1`: disable built-in sport mode and switch to stand policy
+- `Y`: start parkour policy
+- `L2`: exit parkour and re-enable built-in sport mode
+
+#### MuJoCo Heightmap Debug
+Use `run_mujoco_heightmap_serial.py` to run the heightmap student policy directly in MuJoCo. The default motor backend is MuJoCo, so no real motor serial port is required.
+
+Example command:
+```bash
+python3 run_mujoco_heightmap_serial.py \
+	--heightmap_model /home/rc_kfs/Extreme-Parkour-Onboard/traced/student_34000-34000-heightmap_jit.pt \
+	--device cpu \
+	--mode parkour \
+	--height_noise_std 0 \
+	--command_source mux \
+	--keyboard_initial_mode 0 \
+	--motor_backend mujoco \
+	--debug_items height \
+	--debug_every 10 \
+	--debug_height_count 20 \
+	--visualize_heightmap
+```
+
+Common options:
+- `--heightmap_model`: traced heightmap student policy.
+- `--mujoco_xml`: MuJoCo robot XML. Default is `/home/rc_kfs/extreme-parkour/legged_gym/resources/robots/mybot_v3/xml/mybot_v3.xml`.
+- `--command_source`: command input source. `mux` uses UDP first, then keyboard, then fixed command.
+- `--keyboard_initial_mode 0`: start in idle mode.
+- `--motor_backend mujoco`: send policy targets directly to MuJoCo. Use `sdk` only when testing real motor serial output.
+- `--height_noise_std 0`: disable heightmap noise for debugging.
+- `--visualize_heightmap`: draw sampled heightmap points in the MuJoCo viewer.
+
+Keyboard controls:
+```text
+0      idle / zero torque
+1      stand up / default pose
+2      RL policy mode
+3      joint damping
+4      return default pose
+
+W/S    increase/decrease vx
+Q/E    increase/decrease vy
+A/D    increase/decrease yaw rate
+R      reset velocity command to zero
+Space  emergency stop
+Esc    stop keyboard listener
+```
+
+Debug output is controlled by:
+```bash
+--debug_items cmd,base,height,obs,action,target,joint,motor
+--debug_every 10
+--debug_height_count 20
+```
+
+Debug fields:
+- `cmd`: current velocity command and estop flag.
+- `base`: MuJoCo base position and yaw.
+- `height`: heightmap values sent to the student model. `min/max/mean` show the full scan statistics, and `firstN` prints the first `N` points.
+- `obs`: proprioceptive observation statistics.
+- `action`: raw policy action statistics.
+- `target`: target joint positions after action scaling.
+- `joint`: current MuJoCo joint position and velocity.
+- `motor`: Python Unitree SDK feedback, only available with `--motor_backend sdk` or `both`.
+
+For heightmap debugging, the important check is whether `height min/max` changes when the sampled points pass over obstacles. On flat ground, all height values can be nearly identical. The current MuJoCo debug formula temporarily uses `base_z - measured_terrain_height`; the original training formula is `base_z - 0.3 - measured_terrain_height` and is left as a comment in the script.
+
 #### Policy selection:
 Modify in `run_extreme_parkour.py`:
 ```bash

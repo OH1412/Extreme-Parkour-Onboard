@@ -87,6 +87,8 @@ class Go2Node(UnitreeRos2Real):
         )
         
     def main_loop(self):
+        self.handle_udp()
+
         if self.use_sport_mode:
             if (self.joy_stick_buffer.keys & self.WirelessButtons.R1):
                 self.get_logger().info("In the sport mode, R1 pressed, robot will stand up.")
@@ -197,6 +199,11 @@ def main(args):
         model_device= device,
         dryrun= not args.nodryrun,
         mode = args.mode,
+        teleop_udp_enable=args.teleop_udp,
+        teleop_udp_port=args.teleop_udp_port,
+        motor_backend=args.motor_backend,
+        external_motor_cmd_topic=args.external_motor_cmd_topic,
+        external_motor_state_topic=args.external_motor_state_topic,
     )
 
     env_node.get_logger().info("Model loaded from: {}".format(osp.join(args.logdir)))
@@ -284,6 +291,11 @@ if __name__ == "__main__":
         help= "Select which mode to run the main policy control iteration",
     )
     parser.add_argument("--mode", type= str, default= "parkour", choices=["parkour", "walk"])
+    parser.add_argument("--teleop_udp", action="store_true", default=False, help="Enable packed UDP teleop input")
+    parser.add_argument("--teleop_udp_port", type=int, default=9870, help="UDP teleop listen port")
+    parser.add_argument("--motor_backend", type=str, default="external_ros", choices=["external_ros", "lowcmd"])
+    parser.add_argument("--external_motor_cmd_topic", type=str, default="/external_joint_cmd")
+    parser.add_argument("--external_motor_state_topic", type=str, default="/external_joint_state")
     args = parser.parse_args()
     
     main(args)

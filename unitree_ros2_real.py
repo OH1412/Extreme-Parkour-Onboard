@@ -134,6 +134,7 @@ class UnitreeRos2Real(Node):
             low_cmd_topic= "/lowcmd",
             joy_stick_topic= "/wirelesscontroller",
             depth_data_topic= "/forward_depth_image",
+            depth_data_shape= (58, 87),
             cfg= dict(),
             lin_vel_deadband= 0.1,
             ang_vel_deadband= 0.1,
@@ -158,6 +159,7 @@ class UnitreeRos2Real(Node):
         self.low_cmd_topic = low_cmd_topic if not dryrun else low_cmd_topic + "_dryrun_" + str(np.random.randint(0, 65535))
         self.joy_stick_topic = joy_stick_topic
         self.depth_data_topic = depth_data_topic
+        self.depth_data_shape = tuple(depth_data_shape) if isinstance(depth_data_shape, (list, tuple)) else (int(depth_data_shape),)
         self.cfg = cfg
         self.lin_vel_deadband = lin_vel_deadband
         self.ang_vel_deadband = ang_vel_deadband
@@ -427,7 +429,15 @@ class UnitreeRos2Real(Node):
                 self.get_logger().info("Roll Command: " + str(self.roll_pitch_yaw_cmd))
 
     def _depth_data_callback(self, msg):
-        self.depth_data = torch.tensor(msg.data, dtype=torch.float32).reshape(1, 58, 87).to(self.model_device)
+        depth_data = torch.tensor(msg.data, dtype=torch.float32)
+        expected_numel = int(np.prod(self.depth_data_shape))
+        if depth_data.numel() != expected_numel:
+            self.get_logger().warn(
+                f"Depth/heightmap topic shape mismatch: got {depth_data.numel()} values, expected {expected_numel} for shape {self.depth_data_shape}.",
+                throttle_duration_sec= 1,
+            )
+            return
+        self.depth_data = depth_data.reshape((1,) + self.depth_data_shape).to(self.model_device)
 
     
     def _sport_mode_change(self, mode):

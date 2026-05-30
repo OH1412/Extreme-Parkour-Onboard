@@ -311,9 +311,13 @@ class LeggedRobot(BaseTask):
                 cv2.waitKey(1)
 
     def reindex_feet(self, vec):
+        if not self.cfg.env.reorder_dofs:
+            return vec
         return vec[:, [1, 0, 3, 2]]
 
     def reindex(self, vec):
+        if not self.cfg.env.reorder_dofs:
+            return vec
         return vec[:, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]]
 
     def check_termination(self):
@@ -420,21 +424,25 @@ class LeggedRobot(BaseTask):
             # target 是怎么获取的，按照这篇文章的思路，可能是网络计算给出来的（控制器输入呢？管用么？）
             self.delta_yaw = self.target_yaw - self.yaw
             self.delta_next_yaw = self.next_target_yaw - self.yaw
-        obs_buf = torch.cat((#skill_vector, 
-                            self.base_ang_vel  * self.obs_scales.ang_vel,   #[1,3] 机身角速度
-                            imu_obs,    #[1,2]
-                            0*self.delta_yaw[:, None], # 占位
-                            self.delta_yaw[:, None], # 当前偏航角误差
-                            self.delta_next_yaw[:, None], # 下一个偏航角误差
-                            0*self.commands[:, 0:2], # 两个来自控制器的命令，占位？
-                            self.commands[:, 0:1],  #[1,1] 前进速度命令
-                            (self.env_class != 17).float()[:, None], # 为什么和第 17 个环境有关？
-                            (self.env_class == 17).float()[:, None],
-                            self.reindex((self.dof_pos - self.default_dof_pos_all) * self.obs_scales.dof_pos), # 12
-                            self.reindex(self.dof_vel * self.obs_scales.dof_vel), # 12
-                            self.reindex(self.action_history_buf[:, -1]), # 12
-                            self.reindex_feet(self.contact_filt.float()-0.5),# 与接触物的碰撞 # 四只脚的接触状态 # 可以获取
-                            ),dim=-1) # 53
+        obs_parts = [#skill_vector,
+                    self.base_ang_vel  * self.obs_scales.ang_vel,   #[1,3] 机身角速度
+                    imu_obs,    #[1,2]
+                    0*self.delta_yaw[:, None], # 占位
+                    self.delta_yaw[:, None], # 当前偏航角误差
+                    self.delta_next_yaw[:, None], # 下一个偏航角误差
+                    0*self.commands[:, 0:2], # 两个来自控制器的命令，占位？
+                    self.commands[:, 0:1],  #[1,1] 前进速度命令
+                    (self.env_class != 17).float()[:, None], # 为什么和第 17 个环境有关？
+                    (self.env_class == 17).float()[:, None],
+                    self.reindex((self.dof_pos - self.default_dof_pos_all) * self.obs_scales.dof_pos), # 12
+                    self.reindex(self.dof_vel * self.obs_scales.dof_vel), # 12
+                    self.reindex(self.action_history_buf[:, -1]), # 12
+                    ]
+        if self.cfg.env.include_foot_contacts:
+            obs_parts.append(
+                self.reindex_feet(self.contact_filt.float()-0.5),# 与接触物的碰撞 # 四只脚的接触状态 # 可以获取
+            )
+        obs_buf = torch.cat(obs_parts, dim=-1) # 53 with contacts, 49 without contacts
         # print('action stores in actino history buffer: ', self.reindex(self.action_history_buf[:, -1]))
         # print('base ang vel: ', type(self.base_ang_vel), self.base_ang_vel)
         # print('imu obs: ', type(imu_obs), imu_obs)
