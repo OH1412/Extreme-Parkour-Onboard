@@ -1,3 +1,67 @@
+"""Run the MuJoCo heightmap policy.
+
+Example command for the new parkour hurdle terrain with box collision:
+
+PYTHONDONTWRITEBYTECODE=1 python3 run_mujoco_heightmap_serial.py \
+  --logdir traced \
+  --heightmap_model student_34000-34000-heightmap_jit.pt \
+  --task_config mybot_v3 \
+  --mujoco_terrain parkour_hurdle \
+  --terrain_collision box \
+  --terrain_seed 1 \
+  --terrain_difficulty 0.8 \
+  --command_source keyboard \
+  --keyboard_initial_mode 2 \
+  --command_vx 0.5 \
+  --motor_backend mujoco \
+  --debug_items cmd,action,base,height,goal \
+  --debug_every 50 \
+  --visualize_heightmap \
+  --visualize_goals
+
+Useful terrain values:
+  --mujoco_terrain parkour        # old stable box parkour
+  --mujoco_terrain parkour_hurdle # new heightfield terrain, box collision by default
+  --mujoco_terrain parkour_flat
+  --mujoco_terrain parkour_step
+  --mujoco_terrain parkour_gap
+  --mujoco_terrain demo
+
+Important parameters:
+  --logdir
+      Directory containing config.json and traced model files.
+  --heightmap_model
+      JIT heightmap student policy to load from --logdir.
+  --task_config mybot_v3
+      Apply the mybot_v3 training/deployment dimensions, joint order, gains,
+      default joint angles, and heightmap settings.
+  --mujoco_terrain
+      Terrain used in MuJoCo. "parkour" keeps the older stable box terrain.
+      The other parkour_* values use generated heightfield terrain.
+  --terrain_collision box
+      For generated heightfield terrains, render the mesh but use merged box
+      geoms for contact. This usually gives more stable foot contact than mesh.
+      Use "mesh" only for comparison/debug.
+  --terrain_seed
+      Random seed for terrain layout. Reuse the same value to reproduce a run.
+  --terrain_difficulty
+      Terrain difficulty. A negative value samples the training-style hard range
+      [0.7, 1.0]; fixed values such as 0.8 make debugging repeatable.
+  --command_source keyboard
+      Use keyboard/remote-style control instead of a fixed command.
+  --keyboard_initial_mode 2
+      Start directly in policy walking mode. Mode 1 stands, mode 2 walks.
+  --command_vx
+      Initial forward velocity command in m/s.
+  --motor_backend mujoco
+      Send actions only to MuJoCo simulation. Do not command real motors.
+  --debug_items
+      Comma-separated debug fields printed every --debug_every policy steps.
+      Common values are cmd,action,base,height,goal.
+  --visualize_heightmap / --visualize_goals
+      Show sampled height points and target goals in the MuJoCo viewer.
+"""
+
 import argparse
 import json
 import os
@@ -1284,6 +1348,473 @@ def resolve_model_path(logdir, model_path):
     return osp.join(logdir, model_path)
 
 
+class MujocoSubTerrain:
+    def __init__(self, width, length, vertical_scale, horizontal_scale):
+        # Match isaacgym.terrain_utils.SubTerrain naming used by the training code:
+        # width is x samples, length is y samples.
+        self.width = int(width)
+        self.length = int(length)
+        self.vertical_scale = float(vertical_scale)
+        self.horizontal_scale = float(horizontal_scale)
+        self.height_field_raw = np.zeros((self.width, self.length), dtype=np.int16)
+
+
+def add_random_uniform_roughness(terrain, min_height, max_height, step=0.005, downsampled_scale=0.075):
+    if max_height <= min_height:
+        return
+    heights = np.arange(min_height, max_height + step, step)
+    if heights.size == 0:
+        return
+    down_rows = max(2, int(terrain.width * terrain.horizontal_scale / downsampled_scale))
+    down_cols = max(2, int(terrain.length * terrain.horizontal_scale / downsampled_scale))
+    sampled = np.random.choice(heights, size=(down_rows, down_cols))
+    x = np.linspace(0.0, 1.0, down_rows)
+    y = np.linspace(0.0, 1.0, down_cols)
+    xi = np.linspace(0.0, 1.0, terrain.width)
+    yi = np.linspace(0.0, 1.0, terrain.length)
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+
+        interp = RegularGridInterpolator((x, y), sampled, bounds_error=False, fill_value=None)
+        grid_x, grid_y = np.meshgrid(xi, yi, indexing="ij")
+        rough = interp(np.stack([grid_x, grid_y], axis=-1))
+    except Exception:
+        row_idx = np.minimum((xi * (down_rows - 1)).astype(np.int32), down_rows - 1)
+        col_idx = np.minimum((yi * (down_cols - 1)).astype(np.int32), down_cols - 1)
+        rough = sampled[row_idx[:, None], col_idx[None, :]]
+    terrain.height_field_raw += np.round(rough / terrain.vertical_scale).astype(np.int16)
+
+
+def add_parkour_roughness(terrain, cfg, difficulty=1.0):
+    height_cfg = cfg.get("height", [0.02, 0.06])
+    max_height = (float(height_cfg[1]) - float(height_cfg[0])) * difficulty + float(height_cfg[0])
+    height = float(np.random.uniform(float(height_cfg[0]), max_height))
+    add_random_uniform_roughness(
+        terrain,
+        min_height=-height,
+        max_height=height,
+        step=0.005,
+        downsampled_scale=float(cfg.get("downsampled_scale", 0.075)),
+    )
+
+
+def parkour_terrain_hf(
+    terrain,
+    platform_len=2.5,
+    platform_height=0.0,
+    num_stones=8,
+    x_range=None,
+    y_range=None,
+    z_range=None,
+    stone_len=1.0,
+    stone_width=0.6,
+    pad_width=0.1,
+    pad_height=0.5,
+    incline_height=0.1,
+    last_incline_height=0.6,
+    last_stone_len=1.6,
+    pit_depth=None,
+):
+    x_range = [1.8, 1.9] if x_range is None else x_range
+    y_range = [0.0, 0.1] if y_range is None else y_range
+    z_range = [-0.2, 0.2] if z_range is None else z_range
+    pit_depth = [0.5, 1.0] if pit_depth is None else pit_depth
+    goals = np.zeros((num_stones + 2, 2), dtype=np.float32)
+    terrain.height_field_raw[:] = -round(np.random.uniform(pit_depth[0], pit_depth[1]) / terrain.vertical_scale)
+
+    mid_y = terrain.length // 2
+    if isinstance(stone_len, (list, tuple)):
+        stone_len = np.random.uniform(*stone_len)
+    stone_len = 2 * round(float(stone_len) / 2.0, 1)
+    stone_len = round(stone_len / terrain.horizontal_scale)
+    dis_x_min = stone_len + round(x_range[0] / terrain.horizontal_scale)
+    dis_x_max = stone_len + round(x_range[1] / terrain.horizontal_scale)
+    dis_y_min = round(y_range[0] / terrain.horizontal_scale)
+    dis_y_max = round(y_range[1] / terrain.horizontal_scale)
+    dis_z_min = round(z_range[0] / terrain.vertical_scale)
+    dis_z_max = round(z_range[1] / terrain.vertical_scale)
+
+    platform_len = round(platform_len / terrain.horizontal_scale)
+    platform_height = round(platform_height / terrain.vertical_scale)
+    terrain.height_field_raw[0:platform_len, :] = platform_height
+
+    stone_width = round(stone_width / terrain.horizontal_scale)
+    last_stone_len = round(last_stone_len / terrain.horizontal_scale)
+    incline_height = round(incline_height / terrain.vertical_scale)
+    last_incline_height = round(last_incline_height / terrain.vertical_scale)
+
+    dis_x = platform_len - np.random.randint(dis_x_min, dis_x_max) + stone_len // 2
+    goals[0] = [platform_len - stone_len // 2, mid_y]
+    left_right_flag = np.random.randint(0, 2)
+    dis_z = 0
+    for i in range(num_stones):
+        dis_x += np.random.randint(dis_x_min, dis_x_max)
+        pos_neg = round(2 * (left_right_flag - 0.5))
+        dis_y = mid_y + pos_neg * np.random.randint(dis_y_min, dis_y_max)
+        if i == num_stones - 1:
+            dis_x += last_stone_len // 4
+            heights = np.tile(np.linspace(-last_incline_height, last_incline_height, stone_width), (last_stone_len, 1)) * pos_neg
+            terrain.height_field_raw[
+                dis_x - last_stone_len // 2 : dis_x + last_stone_len // 2,
+                dis_y - stone_width // 2 : dis_y + stone_width // 2,
+            ] = heights.astype(int) + dis_z
+        else:
+            heights = np.tile(np.linspace(-incline_height, incline_height, stone_width), (stone_len, 1)) * pos_neg
+            terrain.height_field_raw[
+                dis_x - stone_len // 2 : dis_x + stone_len // 2,
+                dis_y - stone_width // 2 : dis_y + stone_width // 2,
+            ] = heights.astype(int) + dis_z
+        goals[i + 1] = [dis_x, dis_y]
+        left_right_flag = 1 - left_right_flag
+
+    final_dis_x = dis_x + 2 * np.random.randint(dis_x_min, dis_x_max)
+    final_platform_start = dis_x + last_stone_len // 2 + round(0.05 // terrain.horizontal_scale)
+    terrain.height_field_raw[final_platform_start:, :] = platform_height
+    goals[-1] = [final_dis_x, mid_y]
+    terrain.goals = goals * terrain.horizontal_scale
+    apply_terrain_padding(terrain, pad_width, pad_height)
+
+
+def parkour_hurdle_terrain_hf(
+    terrain,
+    platform_len=2.5,
+    platform_height=0.0,
+    num_stones=8,
+    stone_len=0.3,
+    x_range=None,
+    y_range=None,
+    half_valid_width=None,
+    hurdle_height_range=None,
+    pad_width=0.1,
+    pad_height=0.5,
+    flat=False,
+):
+    x_range = [1.5, 2.4] if x_range is None else x_range
+    y_range = [-0.4, 0.4] if y_range is None else y_range
+    half_valid_width = [0.4, 0.8] if half_valid_width is None else half_valid_width
+    hurdle_height_range = [0.2, 0.3] if hurdle_height_range is None else hurdle_height_range
+    goals = np.zeros((num_stones + 2, 2), dtype=np.float32)
+    mid_y = terrain.length // 2
+    dis_x_min = round(x_range[0] / terrain.horizontal_scale)
+    dis_x_max = round(x_range[1] / terrain.horizontal_scale)
+    dis_y_min = round(y_range[0] / terrain.horizontal_scale)
+    dis_y_max = round(y_range[1] / terrain.horizontal_scale)
+    half_valid_width = round(np.random.uniform(half_valid_width[0], half_valid_width[1]) / terrain.horizontal_scale)
+    hurdle_height_max = round(hurdle_height_range[1] / terrain.vertical_scale)
+    hurdle_height_min = round(hurdle_height_range[0] / terrain.vertical_scale)
+    platform_len = round(platform_len / terrain.horizontal_scale)
+    platform_height = round(platform_height / terrain.vertical_scale)
+    terrain.height_field_raw[0:platform_len, :] = platform_height
+    stone_len = round(stone_len / terrain.horizontal_scale)
+
+    dis_x = platform_len
+    goals[0] = [platform_len - 1, mid_y]
+    for i in range(num_stones):
+        rand_x = np.random.randint(dis_x_min, dis_x_max)
+        rand_y = np.random.randint(dis_y_min, dis_y_max)
+        dis_x += rand_x
+        if not flat:
+            terrain.height_field_raw[dis_x - stone_len // 2 : dis_x + stone_len // 2, :] = np.random.randint(
+                hurdle_height_min, hurdle_height_max
+            )
+            terrain.height_field_raw[dis_x - stone_len // 2 : dis_x + stone_len // 2, : mid_y + rand_y - half_valid_width] = 0
+            terrain.height_field_raw[dis_x - stone_len // 2 : dis_x + stone_len // 2, mid_y + rand_y + half_valid_width :] = 0
+        goals[i + 1] = [dis_x - rand_x // 2, mid_y + rand_y]
+    final_dis_x = dis_x + np.random.randint(dis_x_min, dis_x_max)
+    if final_dis_x > terrain.width:
+        final_dis_x = terrain.width - 0.5 // terrain.horizontal_scale
+    goals[-1] = [final_dis_x, mid_y]
+    terrain.goals = goals * terrain.horizontal_scale
+    apply_terrain_padding(terrain, pad_width, pad_height)
+
+
+def parkour_step_terrain_hf(
+    terrain,
+    platform_len=2.5,
+    platform_height=0.0,
+    num_stones=8,
+    x_range=None,
+    y_range=None,
+    half_valid_width=None,
+    step_height=0.2,
+    pad_width=0.1,
+    pad_height=0.5,
+):
+    x_range = [0.2, 0.4] if x_range is None else x_range
+    y_range = [-0.15, 0.15] if y_range is None else y_range
+    half_valid_width = [0.45, 0.5] if half_valid_width is None else half_valid_width
+    goals = np.zeros((num_stones + 2, 2), dtype=np.float32)
+    mid_y = terrain.length // 2
+    dis_x_min = round((x_range[0] + step_height) / terrain.horizontal_scale)
+    dis_x_max = round((x_range[1] + step_height) / terrain.horizontal_scale)
+    dis_y_min = round(y_range[0] / terrain.horizontal_scale)
+    dis_y_max = round(y_range[1] / terrain.horizontal_scale)
+    step_height = round(step_height / terrain.vertical_scale)
+    half_valid_width = round(np.random.uniform(half_valid_width[0], half_valid_width[1]) / terrain.horizontal_scale)
+    platform_len = round(platform_len / terrain.horizontal_scale)
+    platform_height = round(platform_height / terrain.vertical_scale)
+    terrain.height_field_raw[0:platform_len, :] = platform_height
+
+    dis_x = platform_len
+    last_dis_x = dis_x
+    stair_height = 0
+    goals[0] = [platform_len - round(1 / terrain.horizontal_scale), mid_y]
+    for i in range(num_stones):
+        rand_x = np.random.randint(dis_x_min, dis_x_max)
+        rand_y = np.random.randint(dis_y_min, dis_y_max)
+        if i < num_stones // 2:
+            stair_height += step_height
+        elif i > num_stones // 2:
+            stair_height -= step_height
+        terrain.height_field_raw[dis_x : dis_x + rand_x, :] = stair_height
+        dis_x += rand_x
+        terrain.height_field_raw[last_dis_x:dis_x, : mid_y + rand_y - half_valid_width] = 0
+        terrain.height_field_raw[last_dis_x:dis_x, mid_y + rand_y + half_valid_width :] = 0
+        last_dis_x = dis_x
+        goals[i + 1] = [dis_x - rand_x // 2, mid_y + rand_y]
+    final_dis_x = dis_x + np.random.randint(dis_x_min, dis_x_max)
+    if final_dis_x > terrain.width:
+        final_dis_x = terrain.width - 0.5 // terrain.horizontal_scale
+    goals[-1] = [final_dis_x, mid_y]
+    terrain.goals = goals * terrain.horizontal_scale
+    apply_terrain_padding(terrain, pad_width, pad_height)
+
+
+def parkour_gap_terrain_hf(
+    terrain,
+    platform_len=2.5,
+    platform_height=0.0,
+    num_gaps=8,
+    gap_size=0.3,
+    x_range=None,
+    y_range=None,
+    half_valid_width=None,
+    gap_depth=None,
+    pad_width=0.1,
+    pad_height=0.5,
+    flat=False,
+):
+    x_range = [1.6, 2.4] if x_range is None else x_range
+    y_range = [-1.2, 1.2] if y_range is None else y_range
+    half_valid_width = [0.6, 1.2] if half_valid_width is None else half_valid_width
+    gap_depth = [0.2, 1.0] if gap_depth is None else gap_depth
+    goals = np.zeros((num_gaps + 2, 2), dtype=np.float32)
+    mid_y = terrain.length // 2
+    dis_y_min = round(y_range[0] / terrain.horizontal_scale)
+    dis_y_max = round(y_range[1] / terrain.horizontal_scale)
+    platform_len = round(platform_len / terrain.horizontal_scale)
+    platform_height = round(platform_height / terrain.vertical_scale)
+    gap_depth = -round(np.random.uniform(gap_depth[0], gap_depth[1]) / terrain.vertical_scale)
+    half_valid_width = round(np.random.uniform(half_valid_width[0], half_valid_width[1]) / terrain.horizontal_scale)
+    terrain.height_field_raw[0:platform_len, :] = platform_height
+    gap_size = round(gap_size / terrain.horizontal_scale)
+    dis_x_min = round(x_range[0] / terrain.horizontal_scale) + gap_size
+    dis_x_max = round(x_range[1] / terrain.horizontal_scale) + gap_size
+
+    dis_x = platform_len
+    goals[0] = [platform_len - 1, mid_y]
+    last_dis_x = dis_x
+    for i in range(num_gaps):
+        rand_x = np.random.randint(dis_x_min, dis_x_max)
+        dis_x += rand_x
+        rand_y = np.random.randint(dis_y_min, dis_y_max)
+        if not flat:
+            terrain.height_field_raw[dis_x - gap_size // 2 : dis_x + gap_size // 2, :] = gap_depth
+        terrain.height_field_raw[last_dis_x:dis_x, : mid_y + rand_y - half_valid_width] = gap_depth
+        terrain.height_field_raw[last_dis_x:dis_x, mid_y + rand_y + half_valid_width :] = gap_depth
+        last_dis_x = dis_x
+        goals[i + 1] = [dis_x - rand_x // 2, mid_y + rand_y]
+    final_dis_x = dis_x + np.random.randint(dis_x_min, dis_x_max)
+    if final_dis_x > terrain.width:
+        final_dis_x = terrain.width - 0.5 // terrain.horizontal_scale
+    goals[-1] = [final_dis_x, mid_y]
+    terrain.goals = goals * terrain.horizontal_scale
+    apply_terrain_padding(terrain, pad_width, pad_height)
+
+
+def demo_terrain_hf(terrain):
+    goals = np.zeros((8, 2), dtype=np.float32)
+    mid_y = terrain.length // 2
+    platform_length = round(2 / terrain.horizontal_scale)
+    hurdle_depth = round(np.random.uniform(0.35, 0.4) / terrain.horizontal_scale)
+    hurdle_height = round(np.random.uniform(0.3, 0.36) / terrain.vertical_scale)
+    hurdle_width = round(np.random.uniform(1, 1.2) / terrain.horizontal_scale)
+    goals[0] = [platform_length + hurdle_depth / 2, mid_y]
+    terrain.height_field_raw[
+        platform_length : platform_length + hurdle_depth,
+        round(mid_y - hurdle_width / 2) : round(mid_y + hurdle_width / 2),
+    ] = hurdle_height
+
+    platform_length += round(np.random.uniform(1.5, 2.5) / terrain.horizontal_scale)
+    first_step_depth = round(np.random.uniform(0.45, 0.8) / terrain.horizontal_scale)
+    first_step_height = round(np.random.uniform(0.35, 0.45) / terrain.vertical_scale)
+    first_step_width = round(np.random.uniform(1, 1.2) / terrain.horizontal_scale)
+    goals[1] = [platform_length + first_step_depth / 2, mid_y]
+    terrain.height_field_raw[
+        platform_length : platform_length + first_step_depth,
+        round(mid_y - first_step_width / 2) : round(mid_y + first_step_width / 2),
+    ] = first_step_height
+
+    platform_length += first_step_depth
+    second_step_depth = round(np.random.uniform(0.45, 0.8) / terrain.horizontal_scale)
+    goals[2] = [platform_length + second_step_depth / 2, mid_y]
+    terrain.height_field_raw[
+        platform_length : platform_length + second_step_depth,
+        round(mid_y - first_step_width / 2) : round(mid_y + first_step_width / 2),
+    ] = first_step_height
+
+    platform_length += second_step_depth + round(np.random.uniform(0.5, 0.8) / terrain.horizontal_scale)
+    third_step_depth = round(np.random.uniform(0.25, 0.6) / terrain.horizontal_scale)
+    third_step_width = round(np.random.uniform(1, 1.2) / terrain.horizontal_scale)
+    goals[3] = [platform_length + third_step_depth / 2, mid_y]
+    terrain.height_field_raw[
+        platform_length : platform_length + third_step_depth,
+        round(mid_y - third_step_width / 2) : round(mid_y + third_step_width / 2),
+    ] = first_step_height
+
+    platform_length += third_step_depth
+    forth_step_depth = round(np.random.uniform(0.25, 0.6) / terrain.horizontal_scale)
+    goals[4] = [platform_length + forth_step_depth / 2, mid_y]
+    terrain.height_field_raw[
+        platform_length : platform_length + forth_step_depth,
+        round(mid_y - third_step_width / 2) : round(mid_y + third_step_width / 2),
+    ] = first_step_height
+
+    platform_length += forth_step_depth + round(np.random.uniform(0.1, 0.4) / terrain.horizontal_scale)
+    left_y = mid_y + round(np.random.uniform(0.15, 0.3) / terrain.horizontal_scale)
+    right_y = mid_y - round(np.random.uniform(0.15, 0.3) / terrain.horizontal_scale)
+    slope_height = round(np.random.uniform(0.15, 0.22) / terrain.vertical_scale)
+    slope_depth = round(np.random.uniform(0.75, 0.85) / terrain.horizontal_scale)
+    slope_width = round(1.0 / terrain.horizontal_scale)
+    platform_height = slope_height + np.random.randint(0, 0.2 / terrain.vertical_scale)
+
+    goals[5] = [platform_length + slope_depth / 2, left_y]
+    heights = np.tile(np.linspace(-slope_height, slope_height, slope_width), (slope_depth, 1))
+    terrain.height_field_raw[
+        platform_length : platform_length + slope_depth,
+        left_y - slope_width // 2 : left_y + slope_width // 2,
+    ] = heights.astype(int) + platform_height
+
+    platform_length += slope_depth + round(np.random.uniform(0.1, 0.4) / terrain.horizontal_scale)
+    goals[6] = [platform_length + slope_depth / 2, right_y]
+    heights = np.tile(np.linspace(-slope_height, slope_height, slope_width), (slope_depth, 1)) * -1
+    terrain.height_field_raw[
+        platform_length : platform_length + slope_depth,
+        right_y - slope_width // 2 : right_y + slope_width // 2,
+    ] = heights.astype(int) + platform_height
+
+    platform_length += slope_depth + round(np.random.uniform(0.1, 0.4) / terrain.horizontal_scale) + round(0.4 / terrain.horizontal_scale)
+    goals[-1] = [platform_length, left_y]
+    terrain.goals = goals * terrain.horizontal_scale
+
+
+def apply_terrain_padding(terrain, pad_width, pad_height):
+    pad_width = int(pad_width // terrain.horizontal_scale)
+    pad_height = int(pad_height // terrain.vertical_scale)
+    terrain.height_field_raw[:, :pad_width] = pad_height
+    terrain.height_field_raw[:, -pad_width:] = pad_height
+    terrain.height_field_raw[:pad_width, :] = pad_height
+    terrain.height_field_raw[-pad_width:, :] = pad_height
+
+
+def convert_heightfield_to_trimesh_np(height_field_raw, horizontal_scale, vertical_scale, slope_threshold=None):
+    hf = height_field_raw
+    num_rows, num_cols = hf.shape
+    y = np.linspace(0, (num_cols - 1) * horizontal_scale, num_cols)
+    x = np.linspace(0, (num_rows - 1) * horizontal_scale, num_rows)
+    yy, xx = np.meshgrid(y, x)
+    if slope_threshold is not None:
+        slope_threshold *= horizontal_scale / vertical_scale
+        move_x = np.zeros((num_rows, num_cols))
+        move_y = np.zeros((num_rows, num_cols))
+        move_corners = np.zeros((num_rows, num_cols))
+        move_x[: num_rows - 1, :] += hf[1:num_rows, :] - hf[: num_rows - 1, :] > slope_threshold
+        move_x[1:num_rows, :] -= hf[: num_rows - 1, :] - hf[1:num_rows, :] > slope_threshold
+        move_y[:, : num_cols - 1] += hf[:, 1:num_cols] - hf[:, : num_cols - 1] > slope_threshold
+        move_y[:, 1:num_cols] -= hf[:, : num_cols - 1] - hf[:, 1:num_cols] > slope_threshold
+        move_corners[: num_rows - 1, : num_cols - 1] += hf[1:num_rows, 1:num_cols] - hf[: num_rows - 1, : num_cols - 1] > slope_threshold
+        move_corners[1:num_rows, 1:num_cols] -= hf[: num_rows - 1, : num_cols - 1] - hf[1:num_rows, 1:num_cols] > slope_threshold
+        xx += (move_x + move_corners * (move_x == 0)) * horizontal_scale
+        yy += (move_y + move_corners * (move_y == 0)) * horizontal_scale
+    vertices = np.zeros((num_rows * num_cols, 3), dtype=np.float32)
+    vertices[:, 0] = xx.flatten()
+    vertices[:, 1] = yy.flatten()
+    vertices[:, 2] = hf.flatten() * vertical_scale
+    triangles = -np.ones((2 * (num_rows - 1) * (num_cols - 1), 3), dtype=np.uint32)
+    for i in range(num_rows - 1):
+        ind0 = np.arange(0, num_cols - 1) + i * num_cols
+        ind1 = ind0 + 1
+        ind2 = ind0 + num_cols
+        ind3 = ind2 + 1
+        start = 2 * i * (num_cols - 1)
+        stop = start + 2 * (num_cols - 1)
+        triangles[start:stop:2, 0] = ind0
+        triangles[start:stop:2, 1] = ind3
+        triangles[start:stop:2, 2] = ind1
+        triangles[start + 1 : stop : 2, 0] = ind0
+        triangles[start + 1 : stop : 2, 1] = ind2
+        triangles[start + 1 : stop : 2, 2] = ind3
+    return vertices, triangles
+
+
+def write_obj_mesh(path, vertices, triangles):
+    with open(path, "w") as f:
+        for v in vertices:
+            f.write(f"v {v[0]:.7f} {v[1]:.7f} {v[2]:.7f}\n")
+        for tri in triangles:
+            f.write(f"f {int(tri[0]) + 1} {int(tri[1]) + 1} {int(tri[2]) + 1}\n")
+
+
+def heightfield_to_box_geoms(height_field_raw, horizontal_scale, vertical_scale, origin_shift, stride=2, height_step=0.02):
+    hf_m = height_field_raw.astype(np.float32) * float(vertical_scale)
+    rows, cols = hf_m.shape
+    stride = max(1, int(stride))
+    height_step = max(1e-4, float(height_step))
+    bottom_z = float(hf_m.min() - 0.05)
+    geoms = []
+    for r0 in range(0, rows - 1, stride):
+        r1 = min(r0 + stride, rows - 1)
+        x0 = r0 * horizontal_scale
+        x1 = r1 * horizontal_scale
+        segments = []
+        c0 = 0
+        while c0 < cols - 1:
+            c1 = min(c0 + stride, cols - 1)
+            top = float(np.max(hf_m[r0 : r1 + 1, c0 : c1 + 1]))
+            top = round(top / height_step) * height_step
+            start_c = c0
+            c0 = c1
+            while c0 < cols - 1:
+                next_c = min(c0 + stride, cols - 1)
+                next_top = float(np.max(hf_m[r0 : r1 + 1, c0 : next_c + 1]))
+                next_top = round(next_top / height_step) * height_step
+                if next_top != top:
+                    break
+                c0 = next_c
+            segments.append((start_c, c0, top))
+
+        for start_c, end_c, top in segments:
+            y0 = start_c * horizontal_scale
+            y1 = end_c * horizontal_scale
+            thickness = max(top - bottom_z, 0.002)
+            geoms.append(
+                {
+                    "name": f"terrain_box_{len(geoms)}",
+                    "pos": [
+                        (x0 + x1) * 0.5 - float(origin_shift[0]),
+                        (y0 + y1) * 0.5 - float(origin_shift[1]),
+                        bottom_z + thickness * 0.5,
+                    ],
+                    "size": [
+                        max((x1 - x0) * 0.5, 0.001),
+                        max((y1 - y0) * 0.5, 0.001),
+                        thickness * 0.5,
+                    ],
+                }
+            )
+    return geoms
+
+
 def generate_parkour_course(cfg, seed=None, difficulty=0.5):
     rng = np.random.default_rng(seed)
     terrain_cfg = cfg.get("terrain", {})
@@ -1291,10 +1822,8 @@ def generate_parkour_course(cfg, seed=None, difficulty=0.5):
     num_stones = max(1, num_goals - 2)
     horizontal_scale = float(terrain_cfg.get("horizontal_scale", 0.05))
     if difficulty < 0.0:
-        # play.py sets max_difficulty=True, which samples difficulty in [0.7, 1.0].
         difficulty = float(rng.uniform(0.7, 1.0))
 
-    # Matches Terrain.make_terrain() for terrain_dict {"parkour": 1.0}.
     x_range = [-0.1, 0.1 + 0.3 * difficulty]
     y_range = [0.2, 0.3 + 0.1 * difficulty]
     stone_len_range = [0.9 - 0.3 * difficulty, 1.0 - 0.2 * difficulty]
@@ -1314,16 +1843,14 @@ def generate_parkour_course(cfg, seed=None, difficulty=0.5):
     dis_y_min, dis_y_max = y_range
 
     goals = np.zeros((num_stones + 2, 3), dtype=np.float32)
-    geoms = []
-
-    geoms.append(
+    geoms = [
         {
             "name": "parkour_start_platform",
             "pos": [platform_len / 2.0 - robot_origin_x, 0.0, platform_height / 2.0],
             "size": [platform_len / 2.0, 2.0, 0.025],
             "rgba": "0.45 0.45 0.45 1",
         }
-    )
+    ]
     goals[0] = [platform_len - stone_len / 2.0 - robot_origin_x, 0.0, platform_height]
 
     dis_x = platform_len - float(rng.uniform(dis_x_min, dis_x_max)) + stone_len / 2.0
@@ -1369,7 +1896,145 @@ def generate_parkour_course(cfg, seed=None, difficulty=0.5):
         }
     )
     goals[-1] = [final_dis_x - robot_origin_x, 0.0, platform_height]
-    return {"geoms": geoms, "goals": goals, "pit_depth": pit_depth, "horizontal_scale": horizontal_scale}
+    return {"kind": "parkour", "geoms": geoms, "goals": goals, "pit_depth": pit_depth, "horizontal_scale": horizontal_scale}
+
+
+def generate_mujoco_terrain_mesh(
+    cfg,
+    terrain_kind="parkour",
+    seed=None,
+    difficulty=0.5,
+    collision_mode="box",
+    box_stride=2,
+    box_height_step=0.02,
+):
+    if seed is not None:
+        old_state = np.random.get_state()
+        np.random.seed(int(seed))
+    else:
+        old_state = None
+    terrain_cfg = cfg.get("terrain", {})
+    num_goals = int(terrain_cfg.get("num_goals", 8))
+    horizontal_scale = float(terrain_cfg.get("horizontal_scale", 0.05))
+    vertical_scale = float(terrain_cfg.get("vertical_scale", 0.005))
+    terrain_length = float(terrain_cfg.get("terrain_length", 18.0))
+    terrain_width = float(terrain_cfg.get("terrain_width", 4.0))
+    if difficulty < 0.0:
+        difficulty = float(np.random.uniform(0.7, 1.0))
+
+    terrain = MujocoSubTerrain(
+        width=int(terrain_length / horizontal_scale),
+        length=int(terrain_width / horizontal_scale),
+        vertical_scale=vertical_scale,
+        horizontal_scale=horizontal_scale,
+    )
+    num_obstacles = max(1, num_goals - 2)
+    y_range = terrain_cfg.get("y_range", [-0.4, 0.4])
+
+    try:
+        if terrain_kind in ("parkour", "parkour_mesh"):
+            parkour_terrain_hf(
+                terrain,
+                num_stones=num_obstacles,
+                x_range=[-0.1, 0.1 + 0.3 * difficulty],
+                y_range=[0.2, 0.3 + 0.1 * difficulty],
+                incline_height=0.25 * difficulty,
+                stone_len=[0.9 - 0.3 * difficulty, 1.0 - 0.2 * difficulty],
+                stone_width=1.0,
+                last_incline_height=0.25 * difficulty + 0.1 - 0.1 * difficulty,
+                pad_height=0,
+                pit_depth=[0.2, 1.0],
+            )
+        elif terrain_kind == "parkour_hurdle":
+            parkour_hurdle_terrain_hf(
+                terrain,
+                num_stones=num_obstacles,
+                stone_len=0.1 + 0.3 * difficulty,
+                hurdle_height_range=[0.1 + 0.1 * difficulty, 0.15 + 0.25 * difficulty],
+                pad_height=0,
+                x_range=[1.2, 2.2],
+                y_range=y_range,
+                half_valid_width=[0.4, 0.8],
+            )
+        elif terrain_kind == "parkour_flat":
+            parkour_hurdle_terrain_hf(
+                terrain,
+                num_stones=num_obstacles,
+                stone_len=0.1 + 0.3 * difficulty,
+                hurdle_height_range=[0.1 + 0.1 * difficulty, 0.15 + 0.15 * difficulty],
+                pad_height=0,
+                y_range=y_range,
+                half_valid_width=[0.45, 1.0],
+                flat=True,
+            )
+        elif terrain_kind == "parkour_step":
+            parkour_step_terrain_hf(
+                terrain,
+                num_stones=num_obstacles,
+                step_height=0.1 + 0.35 * difficulty,
+                x_range=[0.3, 1.5],
+                y_range=y_range,
+                half_valid_width=[0.5, 1.0],
+                pad_height=0,
+            )
+        elif terrain_kind == "parkour_gap":
+            parkour_gap_terrain_hf(
+                terrain,
+                num_gaps=num_obstacles,
+                gap_size=0.1 + 0.7 * difficulty,
+                gap_depth=[0.2, 1.0],
+                pad_height=0,
+                x_range=[0.8, 1.5],
+                y_range=y_range,
+                half_valid_width=[0.6, 1.2],
+            )
+        elif terrain_kind == "demo":
+            demo_terrain_hf(terrain)
+        else:
+            raise ValueError(f"Unsupported MuJoCo terrain kind {terrain_kind!r}.")
+
+        add_parkour_roughness(terrain, terrain_cfg)
+        vertices, triangles = convert_heightfield_to_trimesh_np(
+            terrain.height_field_raw,
+            horizontal_scale,
+            vertical_scale,
+            slope_threshold=float(terrain_cfg.get("slope_treshold", 1.5)),
+        )
+        # IsaacGym tile origin for reset is (1.0, terrain_width / 2).  MuJoCo reset
+        # starts at (0, 0), so shift the tile and goals into the robot frame.
+        origin_shift = np.array([1.0, terrain_width / 2.0, 0.0], dtype=np.float32)
+        vertices = vertices - origin_shift
+        goals = np.zeros((num_goals, 3), dtype=np.float32)
+        goals[:, :2] = terrain.goals[:num_goals] - origin_shift[:2]
+        mesh_file = tempfile.NamedTemporaryFile(prefix=f"mujoco_{terrain_kind}_", suffix=".obj", dir="/tmp", delete=False)
+        mesh_file.close()
+        write_obj_mesh(mesh_file.name, vertices, triangles)
+        collision_geoms = []
+        if collision_mode == "box":
+            collision_geoms = heightfield_to_box_geoms(
+                terrain.height_field_raw,
+                horizontal_scale,
+                vertical_scale,
+                origin_shift,
+                stride=box_stride,
+                height_step=box_height_step,
+            )
+        return {
+            "kind": terrain_kind,
+            "mesh_file": mesh_file.name,
+            "collision_mode": collision_mode,
+            "collision_geoms": collision_geoms,
+            "goals": goals,
+            "min_z": float(vertices[:, 2].min()),
+            "max_z": float(vertices[:, 2].max()),
+            "horizontal_scale": horizontal_scale,
+            "vertical_scale": vertical_scale,
+            "difficulty": float(difficulty),
+            "height_field_raw": terrain.height_field_raw,
+        }
+    finally:
+        if old_state is not None:
+            np.random.set_state(old_state)
 
 
 def build_mujoco_xml_with_terrain(xml_path, terrain, normalize_dynamics=True):
@@ -1400,26 +2065,67 @@ def build_mujoco_xml_with_terrain(xml_path, terrain, normalize_dynamics=True):
         if worldbody is None:
             raise ValueError("MuJoCo XML has no worldbody.")
         floor = worldbody.find("./geom[@name='floor']")
-        if floor is not None:
-            floor.set("pos", f"0 0 {-terrain['pit_depth']:.6f}")
-            floor.set("rgba", "0.08 0.08 0.08 1")
-        for geom_cfg in terrain["geoms"]:
+        if "mesh_file" in terrain:
+            asset = root.find("asset")
+            if asset is None:
+                asset = ET.SubElement(root, "asset")
+            if floor is not None:
+                floor.set("pos", f"0 0 {terrain['min_z'] - 0.2:.6f}")
+                floor.set("rgba", "0.08 0.08 0.08 1")
+            ET.SubElement(asset, "mesh", {"name": "parkour_heightfield_mesh", "file": terrain["mesh_file"]})
             ET.SubElement(
                 worldbody,
                 "geom",
                 {
-                    "name": geom_cfg["name"],
-                    "type": "box",
-                    "pos": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["pos"]),
-                    "size": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["size"]),
-                    "euler": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg.get("euler", [0.0, 0.0, 0.0])),
-                    "rgba": geom_cfg["rgba"],
-                    "contype": "1",
-                    "conaffinity": "1",
+                    "name": f"{terrain['kind']}_trimesh",
+                    "type": "mesh",
+                    "mesh": "parkour_heightfield_mesh",
+                    "rgba": "0.36 0.36 0.36 1",
+                    "contype": "0" if terrain.get("collision_mode") == "box" else "1",
+                    "conaffinity": "0" if terrain.get("collision_mode") == "box" else "1",
                     "condim": "3",
-                    "friction": "1.0 0.3 0.3",
+                    "friction": "1.0 1.0 0.0",
+                    "group": "1" if terrain.get("collision_mode") == "box" else "0",
                 },
             )
+            for geom_cfg in terrain.get("collision_geoms", []):
+                ET.SubElement(
+                    worldbody,
+                    "geom",
+                    {
+                        "name": geom_cfg["name"],
+                        "type": "box",
+                        "pos": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["pos"]),
+                        "size": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["size"]),
+                        "rgba": "0.36 0.36 0.36 0.08",
+                        "contype": "1",
+                        "conaffinity": "1",
+                        "condim": "3",
+                        "friction": "1.0 0.3 0.3",
+                        "group": "3",
+                    },
+                )
+        else:
+            if floor is not None:
+                floor.set("pos", f"0 0 {-terrain['pit_depth']:.6f}")
+                floor.set("rgba", "0.08 0.08 0.08 1")
+            for geom_cfg in terrain["geoms"]:
+                ET.SubElement(
+                    worldbody,
+                    "geom",
+                    {
+                        "name": geom_cfg["name"],
+                        "type": "box",
+                        "pos": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["pos"]),
+                        "size": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg["size"]),
+                        "euler": "{:.6f} {:.6f} {:.6f}".format(*geom_cfg.get("euler", [0.0, 0.0, 0.0])),
+                        "rgba": geom_cfg["rgba"],
+                        "contype": "1",
+                        "conaffinity": "1",
+                        "condim": "3",
+                        "friction": "1.0 0.3 0.3",
+                    },
+                )
 
     tmp = tempfile.NamedTemporaryFile(prefix="mujoco_runtime_", suffix=".xml", dir="/tmp", delete=False)
     tmp.close()
@@ -1593,6 +2299,28 @@ def main(args):
         print(f"[init] Generating parkour terrain (difficulty={args.terrain_difficulty}, seed={args.terrain_seed})...", flush=True)
         terrain = generate_parkour_course(cfg, seed=args.terrain_seed, difficulty=args.terrain_difficulty)
         print("[init] Terrain ready", flush=True)
+    elif args.mujoco_terrain != "flat":
+        print(
+            f"[init] Generating {args.mujoco_terrain} terrain "
+            f"(difficulty={args.terrain_difficulty}, seed={args.terrain_seed})...",
+            flush=True,
+        )
+        terrain = generate_mujoco_terrain_mesh(
+            cfg,
+            terrain_kind=args.mujoco_terrain,
+            seed=args.terrain_seed,
+            difficulty=args.terrain_difficulty,
+            collision_mode=args.terrain_collision,
+            box_stride=args.terrain_box_stride,
+            box_height_step=args.terrain_box_height_step,
+        )
+        print(
+            f"[init] Terrain ready: mesh={terrain['mesh_file']} "
+            f"z=[{terrain['min_z']:.3f},{terrain['max_z']:.3f}] "
+            f"difficulty={terrain['difficulty']:.3f} "
+            f"collision={terrain['collision_mode']} boxes={len(terrain.get('collision_geoms', []))}",
+            flush=True,
+        )
     else:
         print("[init] Using flat terrain", flush=True)
     if args.normalize_mujoco_xml or terrain is not None:
@@ -1747,11 +2475,19 @@ if __name__ == "__main__":
     parser.add_argument("--heightmap_model", type=str, default="heightmap_jit.pt")
     parser.add_argument("--teacher_model", type=str, default=DEFAULT_TEACHER_MODEL)
     parser.add_argument("--mujoco_xml", type=str, default=MYBOT_V3_XML)
-    parser.add_argument("--mujoco_terrain", type=str, default="flat", choices=["flat", "parkour"])
+    parser.add_argument(
+        "--mujoco_terrain",
+        type=str,
+        default="flat",
+        choices=["flat", "parkour", "parkour_mesh", "parkour_hurdle", "parkour_flat", "parkour_step", "parkour_gap", "demo"],
+    )
     parser.add_argument("--normalize_mujoco_xml", dest="normalize_mujoco_xml", action="store_true", default=False)
     parser.add_argument("--no_normalize_mujoco_xml", dest="normalize_mujoco_xml", action="store_false")
     parser.add_argument("--terrain_seed", type=int, default=1)
     parser.add_argument("--terrain_difficulty", type=float, default=-1.0, help="Negative samples play.py max_difficulty range [0.7, 1.0].")
+    parser.add_argument("--terrain_collision", type=str, default="box", choices=["box", "mesh"])
+    parser.add_argument("--terrain_box_stride", type=int, default=2, help="Heightfield samples per generated collision box side.")
+    parser.add_argument("--terrain_box_height_step", type=float, default=0.02, help="Height quantization for merging terrain collision boxes.")
     parser.add_argument("--command_source", type=str, default="fixed", choices=["fixed", "keyboard", "udp", "serial", "mux"])
     parser.add_argument("--command_mode", type=int, default=2)
     parser.add_argument("--command_vx", type=float, default=0.2)
