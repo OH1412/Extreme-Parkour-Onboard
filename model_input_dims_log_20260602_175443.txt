@@ -1,0 +1,49 @@
+
+Model Input Dimensions Log
+Generated: 2026-06-02 17:54:43
+
+=== POLICY INFORMATION ===
+Policy Type: teacher
+Policy Call: policy(obs)
+
+=== INPUT SHAPES ===
+proprio: [1, 53]
+obs: [1, 753]
+heightmap_points: [1, 132]
+actions: [1, 12]
+proprio_history_buf: [1, 10, 53]
+
+=== CONFIGURED DIMENSIONS ===
+n_proprio: 53
+n_points: 132
+n_priv_explicit: 9
+n_priv_latent: 29
+history_len: 10
+num_dof: 12
+
+=== PROPRIOCEPTION LAYOUT ===
+base_ang_vel_scaled: indices [0, 3], present=N/A
+roll_pitch: indices [3, 5], present=N/A
+zero_delta_yaw_placeholder: indices [5, 6], present=N/A
+delta_yaw: indices [6, 7], present=N/A
+delta_next_yaw: indices [7, 8], present=N/A
+zero_command_x_y: indices [8, 10], present=N/A
+command_x: indices [10, 11], present=N/A
+parkour_walk_flags: indices [11, 13], present=N/A
+dof_pos_minus_default_scaled: indices [13, 25], present=N/A
+dof_vel_scaled: indices [25, 37], present=N/A
+last_actions: indices [37, 49], present=N/A
+foot_contacts_minus_0p5: indices [49, 53], present=True
+
+=== OBSERVATION LAYOUT ===
+proprio: indices [0, 53]
+scan_heights: indices [53, 185]
+priv_explicit: indices [185, 194]
+priv_latent: indices [194, 223]
+proprio_history: indices [223, 753]
+
+=== GOAL CONFIGURATION ===
+goal_idx: 0
+delta_yaw: -2.9181048413190307e-05
+delta_next_yaw: 0.14929894335724295
+goals_shape: [8, 3]
