@@ -9,11 +9,9 @@ import yaml
 
 
 NUM_JOINTS = 12
-# These constants intentionally mirror this repository's edited elmap SDK:
-#   /home/rc_kfs/el_ws/elmap-rl-controller/deploy_cpp/include/Unitree_Motor/unitreeMotor/include/motor_msg_GO-M8010-6.h
-# The C++ implementation links the prebuilt libUnitreeMotorSDK_*.so, so the
-# Python path implements the same public packet layout and motor_driver.cpp
-# joint-side <-> motor-side conversion.
+# These constants mirror the GO-M8010-6 packet layout used by the C++ deploy
+# motor driver.  The Python path implements the same joint-side <-> motor-side
+# conversion locally, without loading the external deploy repository at runtime.
 GO_M8010_6_FOC_MODE = 1
 GO_M8010_6_BAUD = 4000000
 

@@ -1,6 +1,85 @@
-"""Run the MuJoCo heightmap policy.
+"""Run the legacy single-process MuJoCo heightmap policy.
 
-Example command for the new parkour hurdle terrain with box collision:
+The deployment path now uses ROS topics as the only interface between MuJoCo
+and the controller.  The planner publishes deploy-style joint commands:
+
+  /mujoco/joint_cmd std_msgs/Float32MultiArray
+  [target_dof_pos(12), kp_joint(12), kd_joint(12)]
+
+This matches the MuJoCo motor command topic format from elmap-rl-controller
+commit 77902c08a3feeef4f64745599a98e8dd1d9c8f29.  Start the ROS simulation
+path as three processes:
+
+Terminal 1, MuJoCo bridge.  This publishes simulated robot observations and
+subscribes to the old local MuJoCo lowcmd format:
+
+PYTHONDONTWRITEBYTECODE=1 python3 run_mujoco_serial_ros_sim.py \
+  --logdir traced \
+  --task_config mybot_v3 \
+  --mujoco_xml robots/mybot_v3/xml/mybot_v3.xml \
+  --low_state_topic /lowstate \
+  --low_cmd_topic /lowcmd \
+  --joy_stick_topic /wirelesscontroller \
+  --heightmap_topic /parkour/heightmap_points \
+  --goal_yaw_topic /parkour/goal_yaw \
+  --mujoco_terrain parkour_hurdle \
+  --terrain_collision box \
+  --terrain_seed 1 \
+  --terrain_difficulty 0.8 \
+  --control_dt 0.02 \
+  --visualize_heightmap \
+  --visualize_goals \
+  --interface simple \
+  --render
+
+Terminal 2, deploy-style joint-command to local MuJoCo lowcmd bridge:
+
+PYTHONDONTWRITEBYTECODE=1 python3 run_joint_cmd_to_mujoco_lowcmd_bridge.py \
+  --joint_cmd_topic /mujoco/joint_cmd \
+  --low_cmd_topic /lowcmd
+
+Terminal 3, legacy policy controller over ROS.  This keeps this script's
+keyboard, observation, policy, action scaling, and PD target logic, but reads
+state through ROS and publishes deploy-style joint commands:
+
+PYTHONDONTWRITEBYTECODE=1 python3 run_mujoco_serial_ros_planner.py \
+  --logdir traced \
+  --task_config mybot_v3 \
+  --heightmap_model student_34000-34000-heightmap_jit.pt \
+  --low_state_topic /lowstate \
+  --joint_cmd_topic /mujoco/joint_cmd \
+  --heightmap_topic /parkour/heightmap_points \
+  --goal_yaw_topic /parkour/goal_yaw \
+  --motor_backend ros \
+  --control_dt 0.02 \
+  --command_source keyboard \
+  --keyboard_initial_mode 2 \
+  --command_vx 0.5
+
+Real robot direct motor backend.  This reads q/dq from GO-M8010-6 feedback via
+the SDK driver, reads IMU from /fast_livo2/state6_imu_prop, reads height/goal
+from ROS, and sends target/kp/kd directly through the Python GO-M8010-6 motor
+driver instead of publishing a motor command topic:
+
+PYTHONDONTWRITEBYTECODE=1 python3 run_mujoco_serial_ros_planner.py \
+  --logdir traced \
+  --task_config mybot_v3 \
+  --heightmap_model student_34000-34000-heightmap_jit.pt \
+  --imu_topic /fast_livo2/state6_imu_prop \
+  --heightmap_topic /parkour/heightmap_points \
+  --goal_yaw_topic /parkour/goal_yaw \
+  --motor_backend sdk \
+  --joint_state_source sdk \
+  --imu_source imu \
+  --sdk_config config/robots/mybot_v2_1_cse.yaml \
+  --sdk_port0 /dev/ttyUSB0 \
+  --sdk_port1 /dev/ttyUSB1 \
+  --control_dt 0.02 \
+  --command_source keyboard \
+  --keyboard_initial_mode 2 \
+  --command_vx 0.5
+
+Legacy single-process debug command:
 
 PYTHONDONTWRITEBYTECODE=1 python3 run_mujoco_heightmap_serial.py \
   --logdir traced \
@@ -86,8 +165,8 @@ from serial_teleop import SerialTeleopController
 from unitree_motor_sdk_python import PythonUnitreeMotorDriver
 
 
-MYBOT_V3_XML = "/home/rc_kfs/extreme-parkour/legged_gym/resources/robots/mybot_v3/xml/mybot_v3.xml"
-ELMAP_SDK_CONFIG = "/home/rc_kfs/el_ws/elmap-rl-controller/deploy_cpp/config/robots/mybot_v2_1_cse.yaml"
+MYBOT_V3_XML = osp.join(osp.dirname(osp.abspath(__file__)), "robots", "mybot_v3", "xml", "mybot_v3.xml")
+ELMAP_SDK_CONFIG = osp.join(osp.dirname(osp.abspath(__file__)), "config", "robots", "mybot_v2_1_cse.yaml")
 
 TEACHER_NUM_PROP = 53
 TEACHER_NUM_SCAN = 132

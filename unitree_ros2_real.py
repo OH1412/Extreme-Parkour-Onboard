@@ -2,13 +2,21 @@ import os, sys
 
 import rclpy
 from rclpy.node import Node
-from unitree_go.msg import (
-    WirelessController,
-    LowState,
-    SportModeState,
-    LowCmd,
-)
-from unitree_api.msg import Request, RequestHeader
+try:
+    from unitree_go.msg import (
+        WirelessController,
+        LowState,
+        SportModeState,
+        LowCmd,
+    )
+    from unitree_api.msg import Request, RequestHeader
+except ModuleNotFoundError:
+    WirelessController = None
+    LowState = None
+    SportModeState = None
+    LowCmd = None
+    Request = None
+    RequestHeader = None
 
 from std_msgs.msg import Float32MultiArray
 
@@ -22,7 +30,11 @@ elif os.uname().machine == "aarch64":
         os.path.dirname(os.path.abspath(__file__)),
         "aarch64",
     ))
-from crc_module import get_crc
+try:
+    from crc_module import get_crc
+except (ImportError, ModuleNotFoundError):
+    def get_crc(_):
+        return 0
 
 from multiprocessing import Process
 from collections import OrderedDict
@@ -149,6 +161,10 @@ class UnitreeRos2Real(Node):
             dof_pos_protect_ratio= 1.1, # if the dof_pos is out of the range of this ratio, the process will shutdown.
             robot_class_name= "Go2",
             dryrun= True, # if True, the robot will not send commands to the real robot
+            dryrun_lowcmd_suffix= True,
+            ros_interface= "auto",
+            require_joy_stick= True,
+            simple_dof_names= None,
             mode= "parkour",
         ):
         super().__init__("unitree_ros2_real")
@@ -156,7 +172,7 @@ class UnitreeRos2Real(Node):
         self.NUM_ACTIONS = getattr(RobotCfgs, robot_class_name).NUM_ACTIONS
         self.robot_namespace = robot_namespace
         self.low_state_topic = low_state_topic
-        self.low_cmd_topic = low_cmd_topic if not dryrun else low_cmd_topic + "_dryrun_" + str(np.random.randint(0, 65535))
+        self.low_cmd_topic = low_cmd_topic if (not dryrun or not dryrun_lowcmd_suffix) else low_cmd_topic + "_dryrun_" + str(np.random.randint(0, 65535))
         self.joy_stick_topic = joy_stick_topic
         self.depth_data_topic = depth_data_topic
         self.depth_data_shape = tuple(depth_data_shape) if isinstance(depth_data_shape, (list, tuple)) else (int(depth_data_shape),)
@@ -174,12 +190,22 @@ class UnitreeRos2Real(Node):
         self.dof_pos_protect_ratio = dof_pos_protect_ratio
         self.robot_class_name = robot_class_name
         self.dryrun = dryrun
+        if ros_interface == "auto":
+            ros_interface = "unitree" if LowState is not None and LowCmd is not None and WirelessController is not None else "simple"
+        self.ros_interface = ros_interface
+        self.require_joy_stick = require_joy_stick
         self.mode = mode
 
         self.dof_map = getattr(RobotCfgs, robot_class_name).dof_map
         self.dof_names = getattr(RobotCfgs, robot_class_name).dof_names
         self.dof_signs = getattr(RobotCfgs, robot_class_name).dof_signs
         self.turn_on_motor_mode = getattr(RobotCfgs, robot_class_name).turn_on_motor_mode
+        if self.ros_interface == "simple" and simple_dof_names is not None:
+            if len(simple_dof_names) != self.NUM_DOF:
+                raise ValueError(f"simple_dof_names has {len(simple_dof_names)} joints, expected {self.NUM_DOF}.")
+            self.dof_names = list(simple_dof_names)
+            self.dof_map = list(range(self.NUM_DOF))
+            self.dof_signs = [1.0] * self.NUM_DOF
 
         self.n_proprio = 53
         self.n_depth_latent = 32
@@ -297,16 +323,20 @@ class UnitreeRos2Real(Node):
         """ after initializing the env and policy, register ros related callbacks and topics
         """
         # ROS publishers
+        low_cmd_msg_type = LowCmd if self.ros_interface == "unitree" else Float32MultiArray
+        low_state_msg_type = LowState if self.ros_interface == "unitree" else Float32MultiArray
+        wireless_msg_type = WirelessController if self.ros_interface == "unitree" else Float32MultiArray
+
         self.low_cmd_pub = self.create_publisher(
-            LowCmd,
+            low_cmd_msg_type,
             self.low_cmd_topic,
             1
         )
-        self.low_cmd_buffer = LowCmd()
+        self.low_cmd_buffer = LowCmd() if self.ros_interface == "unitree" else Float32MultiArray()
 
         # ROS subscribers
         self.low_state_sub = self.create_subscription(
-            LowState,
+            low_state_msg_type,
             self.low_state_topic,
             self._low_state_callback,
             1
@@ -314,24 +344,25 @@ class UnitreeRos2Real(Node):
         self.get_logger().info("Low state subscriber started, waiting to receive low state messages.")
 
         self.joy_stick_sub = self.create_subscription(
-            WirelessController,
+            wireless_msg_type,
             self.joy_stick_topic,
             self._joy_stick_callback,
             1
         )
         self.get_logger().info("Wireless controller subscriber started, waiting to receive wireless controller messages.")
 
-        self.sport_state_pub = self.create_publisher(
-            Request,
-            '/api/robot_state/request',
-            1,
-        )
+        if self.ros_interface == "unitree":
+            self.sport_state_pub = self.create_publisher(
+                Request,
+                '/api/robot_state/request',
+                1,
+            )
 
-        self.sport_mode_pub = self.create_publisher(
-            Request,
-            '/api/sport/request',
-            1,
-        )
+            self.sport_mode_pub = self.create_publisher(
+                Request,
+                '/api/sport/request',
+                1,
+            )
 
         self.depth_input_sub = self.create_subscription(
             Float32MultiArray,
@@ -347,9 +378,12 @@ class UnitreeRos2Real(Node):
             self.get_logger().warn(f"You are publishing low cmd to '{self.low_cmd_topic}' because of dryrun mode, Please check and be safe.")
         while rclpy.ok():
             rclpy.spin_once(self)
-            if hasattr(self, "low_state_buffer") and hasattr(self, "joy_stick_buffer"):
+            if hasattr(self, "low_state_buffer") and (not self.require_joy_stick or hasattr(self, "joy_stick_buffer")):
                 break
-        self.get_logger().info("Low state and wireless message received, the robot is ready to go.")
+        if self.require_joy_stick:
+            self.get_logger().info("Low state and wireless message received, the robot is ready to go.")
+        else:
+            self.get_logger().info("Low state message received, the robot is ready to go.")
 
     """ ROS callbacks and handlers that update the buffer """
 
@@ -357,6 +391,30 @@ class UnitreeRos2Real(Node):
         # self.get_logger().warn("Low state message received.")
         """ store and handle proprioception data """
         self.low_state_buffer = msg # keep the latest low state
+
+        if self.ros_interface == "simple":
+            data = np.asarray(msg.data, dtype=np.float32)
+            expected = 4 + 3 + self.NUM_DOF + self.NUM_DOF + 4
+            if data.size != expected:
+                self.get_logger().warn(
+                    f"Simple lowstate expects {expected} floats [quat,ang_vel,q,dq,contacts], got {data.size}.",
+                    throttle_duration_sec=1,
+                )
+                return
+            q_start = 7
+            dq_start = q_start + self.NUM_DOF
+            self.simple_quat_wxyz = data[0:4].copy()
+            self.simple_ang_vel = data[4:7].copy()
+            self.simple_contacts = data[dq_start + self.NUM_DOF : dq_start + self.NUM_DOF + 4].copy()
+            self.dof_pos_[0, :] = torch.from_numpy(data[q_start:dq_start]).to(
+                device=self.model_device,
+                dtype=torch.float32,
+            )
+            self.dof_vel_[0, :] = torch.from_numpy(data[dq_start:dq_start + self.NUM_DOF]).to(
+                device=self.model_device,
+                dtype=torch.float32,
+            )
+            return
 
         ################### refresh dof_pos and dof_vel ######################
         for sim_idx in range(self.NUM_DOF):
@@ -369,6 +427,10 @@ class UnitreeRos2Real(Node):
     def _joy_stick_callback(self, msg):
         # self.get_logger().warn("Wireless controller message received.")
         self.joy_stick_buffer = msg
+        if self.ros_interface == "simple":
+            keys = int(msg.data[0]) if len(msg.data) > 0 else 0
+            self.simple_joy_keys = keys
+            return
         if self.move_by_wireless_remote:
             # left-y for forward/backward
             ly = msg.ly
@@ -441,6 +503,8 @@ class UnitreeRos2Real(Node):
 
     
     def _sport_mode_change(self, mode):
+        if self.ros_interface != "unitree":
+            return
         msg = Request()
 
         msg.header.identity.id = 0
@@ -455,6 +519,8 @@ class UnitreeRos2Real(Node):
         self.sport_mode_pub.publish(msg)
     
     def _sport_state_change(self, mode):
+        if self.ros_interface != "unitree":
+            return
         msg = Request()
 
         # Fill the header
@@ -479,10 +545,18 @@ class UnitreeRos2Real(Node):
     """ refresh observation buffer and corresponding sub-functions """
     
     def _get_ang_vel_obs(self):
+        if self.ros_interface == "simple":
+            ang_vel = torch.from_numpy(self.simple_ang_vel).unsqueeze(0).to(device=self.model_device, dtype=torch.float32)
+            return ang_vel * self.cfg["normalization"]["obs_scales"]["ang_vel"]
         ang_vel = torch.from_numpy(self.low_state_buffer.imu_state.gyroscope).unsqueeze(0).to(device=self.model_device, dtype=torch.float32)
         return ang_vel * self.cfg["normalization"]["obs_scales"]["ang_vel"]
     
     def _get_imu_obs(self):
+        if self.ros_interface == "simple":
+            quat = self.simple_quat_wxyz
+            quat_xyzw = torch.tensor([quat[1], quat[2], quat[3], quat[0]], device=self.model_device, dtype=torch.float32).unsqueeze(0)
+            roll, pitch, yaw = get_euler_xyz(quat_xyzw)
+            return torch.tensor([[roll, pitch]], device=self.model_device, dtype=torch.float32)
         quat_xyzw = torch.tensor([
             self.low_state_buffer.imu_state.quaternion[1],
             self.low_state_buffer.imu_state.quaternion[2],
@@ -518,6 +592,13 @@ class UnitreeRos2Real(Node):
         return self.actions
 
     def _get_contact_filt_obs(self):
+        if self.ros_interface == "simple":
+            contacts = torch.from_numpy(self.simple_contacts).view(1, 4).to(device=self.model_device, dtype=torch.float32)
+            return torch.where(
+                contacts >= 0.5,
+                torch.full_like(contacts, 0.5),
+                torch.full_like(contacts, -0.5),
+            )
         for i in range(4):
             if self.low_state_buffer.foot_force[i] < 25:
                 self.contact_filt[:, i] = -0.5
@@ -626,7 +707,7 @@ class UnitreeRos2Real(Node):
     def get_stand_action(self):
         if self.firstRun:
             for i in range(12):
-                self.startPos[i] = self.low_state_buffer.motor_state[i].q
+                self.startPos[i] = float(self.dof_pos_[0, i].item()) if self.ros_interface == "simple" else self.low_state_buffer.motor_state[i].q
             self.firstRun = False
 
         self.percent_1 += 1.0 / self.duration_1
@@ -657,6 +738,8 @@ class UnitreeRos2Real(Node):
         #################### check ##############################
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
+            if self.ros_interface == "simple":
+                continue
             if not self.dryrun:
                 self.low_cmd_buffer.motor_cmd[real_idx].mode = self.turn_on_motor_mode[sim_idx]
             self.low_cmd_buffer.motor_cmd[real_idx].q = robot_coordinates_action[sim_idx].item() * self.dof_signs[sim_idx]
@@ -665,11 +748,27 @@ class UnitreeRos2Real(Node):
             self.low_cmd_buffer.motor_cmd[real_idx].kp = self.p_gains[sim_idx].item()
             self.low_cmd_buffer.motor_cmd[real_idx].kd = self.d_gains[sim_idx].item()
         
-        self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)
-        self.low_cmd_pub.publish(self.low_cmd_buffer)
+        if self.ros_interface == "simple":
+            n = self.NUM_DOF
+            q_cmd = robot_coordinates_action.detach().cpu().numpy().astype(np.float32)
+            dq_cmd = np.zeros(n, dtype=np.float32)
+            kp = self.p_gains.detach().cpu().numpy().astype(np.float32)
+            kd = self.d_gains.detach().cpu().numpy().astype(np.float32)
+            tau = np.zeros(n, dtype=np.float32)
+            msg = Float32MultiArray()
+            msg.data = np.concatenate([q_cmd, dq_cmd, kp, kd, tau]).tolist()
+            self.low_cmd_pub.publish(msg)
+        else:
+            self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)
+            self.low_cmd_pub.publish(self.low_cmd_buffer)
 
     def _turn_off_motors(self):
         """ Turn off the motors """
+        if self.ros_interface == "simple":
+            msg = Float32MultiArray()
+            msg.data = [0.0] * (5 * self.NUM_DOF)
+            self.low_cmd_pub.publish(msg)
+            return
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
             self.low_cmd_buffer.motor_cmd[real_idx].mode = 0x00

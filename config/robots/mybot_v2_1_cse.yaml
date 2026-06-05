@@ -1,0 +1,125 @@
+# mybot_v2_1 CSE deployment config copied into this repository.
+# All arrays are in policy DOF order:
+#   0-2 FL hip/thigh/calf, 3-5 FR, 6-8 RL, 9-11 RR.
+
+dt: 0.002
+decimation: 10
+control_dt: 0.02
+num_of_dofs: 12
+
+# Training PD gains, joint side.
+kp_joint: [40.0, 40.0, 80.0, 40.0, 40.0, 80.0, 40.0, 40.0, 80.0, 40.0, 40.0, 80.0]
+kd_joint: [1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+torque_limits: [23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5]
+
+# q_motor = q_joint * ratio. Calf ratio includes the extra 7/3 reducer.
+joint_transmission_ratio: [6.33, 6.33, 14.77, 6.33, 6.33, 14.77, 6.33, 6.33, 14.77, 6.33, 6.33, 14.77]
+
+default_dof_pos:    [0.1, 1.27, -2.70, -0.1, 1.27, -2.70, 0.1, 1.27, -2.80, -0.1, 1.27, -2.80]
+standup_target_pos: [0.1, 0.80, -1.50, -0.1, 0.80, -1.50, 0.1, 0.80, -1.50, -0.1, 0.80, -1.50]
+policy_dof_pos:     [0.1, 0.80, -1.50, -0.1, 0.80, -1.50, 0.1, 0.80, -1.50, -0.1, 0.80, -1.50]
+
+joint_pos_lower: [-0.8, -1.04, -2.69, -0.8, -1.04, -2.69, -0.8, -1.04, -2.69, -0.8, -1.04, -2.69]
+joint_pos_upper: [ 0.8,  4.18, -0.91,  0.8,  4.18, -0.91,  0.8,  4.18, -0.91,  0.8,  4.18, -0.91]
+
+joint_names: [
+  "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+  "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+  "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+  "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"
+]
+joint_controller_names: [
+  "FL_hip", "FL_thigh", "FL_calf",
+  "FR_hip", "FR_thigh", "FR_calf",
+  "RL_hip", "RL_thigh", "RL_calf",
+  "RR_hip", "RR_thigh", "RR_calf"
+]
+
+# Policy DOF -> physical CAN ID. CAN 1-6 default to port0, 7-12 to port1.
+joint_mapping: [4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 11, 12]
+motor_is_reversed: [false, false, true, false, true, false, true, false, true, true, true, false]
+hip_indices: [0, 3, 6, 9]
+wheel_indices: []
+
+adaptation_module_path: policy/adaptation_module_latest_0.jit
+body_path: policy/body_latest_0.jit
+device: cpu
+
+port0: /dev/ttyUSB0
+port1: /dev/ttyUSB1
+imu_topic: /fast_livo2/state6_imu_prop
+height_topic: /height_measurements
+imu_yaw_correction_deg: 0.0
+
+height_points_x: [-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+height_points_y: [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3]
+
+robot_name: mybot_v2_1_cse
+urdf_relpath: robot/mybot_v2_1/urdf/mybot_v2_1.urdf
+mujoco_xml_relpath: robot/mybot_v2_1/xml/mybot_v2_1.xml
+isaac_xml_relpath: robot/mybot_v2_1/xml/mybot_v2_1.xml
+
+# CSE observation normalization from training.
+command_lin_vel_scale: 2.0
+command_yaw_scale: 0.25
+projected_gravity_scale: 1.0
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+height_bias: 0.3
+height_scale: 5.0
+nominal_base_height: 0.34
+# Real height source currently publishes ground_z - base_z (negative on flat
+# ground). Convert raw topic values to positive distance = base_z - ground_z.
+height_measurement_scale: -1.0
+height_measurement_offset: 0.0
+action_scale: 0.25
+clip_obs: 100.0
+clip_actions: 20.0
+require_imu_ready_for_rl: true
+height_sanity_check_enable: true
+gravity_norm_min: 0.8
+gravity_norm_max: 1.2
+gravity_z_max: -0.3
+height_distance_min: 0.05
+height_distance_max: 1.2
+
+cmd_deadband: 0.05
+standup_duration: 2.0
+kd_damp_motor: 0.1
+
+cmd_vx_min: -0.6
+cmd_vx_max: 2.0
+cmd_vy_min: -0.6
+cmd_vy_max: 0.6
+cmd_yaw_min: -1.0
+cmd_yaw_max: 1.0
+cmd_vx_step: 0.1
+cmd_vy_step: 0.1
+cmd_yaw_step: 0.2
+
+teleop_udp_enable: true
+teleop_udp_port: 9870
+
+# Joystick teleop via: ros2 run joy joy_node
+joy_enable: true
+joy_topic: /joy
+joy_axis_deadzone: 0.15
+joy_timeout_s: 0.5
+joy_axis_vx: 1
+joy_axis_vy: 0
+joy_axis_yaw: 2
+joy_invert_vx: false
+joy_invert_vy: false
+joy_invert_yaw: false
+joy_button_stand_up: 0 # Y
+joy_button_return_default: 1 # B
+joy_button_rl: 2 # A
+joy_button_damping: 3
+joy_button_single_step: 4
+joy_button_joint_sweep: 5
+joy_button_idle: 6
+joy_button_confirm: 7
+joy_button_emergency: 8
+
+debug_print_policy: true
+debug_print_interval: 50
